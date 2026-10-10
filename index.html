@@ -72,8 +72,8 @@
 </div>
 
 <script>
-const SUPABASE_URL = 'https://wumnthpdoqswdtpbunev.supabase.co'
-const SUPABASE_KEY = 'sb_publishable_tIT2i2raWHj1kidB0GtzbQ_1erB27Mz'
+const SUPABASE_URL = 'https://YOUR-REF.supabase.co'
+const SUPABASE_KEY = 'YOUR-PUBLISHABLE-KEY'
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
 
 const $ = (id) => document.getElementById(id)
@@ -86,6 +86,8 @@ const audioCache = new Map() // text -> object URL, so a replay does not call TT
 let recog = null
 const waiting = new Map() // ai_charts row id -> { bubble, text } until ai_response arrives
 let me = null             // the signed-in user; me.id is the uuid posted with every question
+let demo = []             // scripted turns from demo_script (Step 7)
+let turn = 0              // the next scripted turn
 
 // ---------- auth ----------
 $('login').onsubmit = async (e) => {
@@ -101,7 +103,13 @@ async function boot() {
   $('thread').classList.remove('hidden')
   $('micWrap').classList.remove('hidden')
 
-  // 1. Today's brief. The first open of the day builds it live from city data (a few seconds)
+  // 1a. Demo script (Step 7): start on an empty screen and pre-load the voice of every scripted answer
+  demo = (await sb.from('demo_script').select('user_text, pulse_text').order('position')).data ?? []
+  if (demo.length) {
+    preload(demo.map((t) => t.pulse_text))
+  } else {
+
+  // 1b. Otherwise today's brief. The first open of the day builds it live from city data
   let { data: brief } = await sb.from('briefs').select('greeting, opportunities, obstacles').eq('day', todayNY()).maybeSingle()
   if (!brief) {
     const wait = aiBubble() // empty black pill while Pulse reads the city data
@@ -110,12 +118,13 @@ async function boot() {
   }
   if (brief?.greeting) aiBubble(brief.greeting)
   for (const item of [...(brief?.opportunities ?? []), ...(brief?.obstacles ?? [])]) aiBubble(item.text)
+  }
 
   // 2. Today's conversation from ai_charts
   const since = new Date(); since.setHours(0, 0, 0, 0)
   const { data: rows } = await sb.from('ai_charts').select('user_prompt, ai_response')
     .gte('created_at', since.toISOString()).order('created_at')
-  for (const r of rows ?? []) { meBubble(r.user_prompt); aiBubble(r.ai_response) }
+  if (!demo.length) for (const r of rows ?? []) { meBubble(r.user_prompt); aiBubble(r.ai_response) } // the demo starts clean
 
   // 3. Hear ai_response arrive in real time
   me = (await sb.auth.getUser()).data.user
@@ -160,19 +169,28 @@ function play(src) {
   return new Promise((resolve) => { player.src = src; player.onended = resolve; player.play() })
 }
 
-async function speak(text) {
-  let url = audioCache.get(text)
-  if (!url) {
+// Fetch the voice once per text and keep it, so a second click plays instantly
+function getAudio(text) {
+  if (!audioCache.has(text)) audioCache.set(text, (async () => {
     const { data: { session } } = await sb.auth.getSession()
     const res = await fetch(`${SUPABASE_URL}/functions/v1/pulse`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY,
                  Authorization: `Bearer ${session.access_token}` },
       body: JSON.stringify({ action: 'speak', text }) })
-    url = URL.createObjectURL(new Blob([await res.arrayBuffer()], { type: 'audio/wav' }))
-    audioCache.set(text, url)
-  }
-  return play(url)
+    if (!res.ok) { audioCache.delete(text); throw new Error('TTS failed') }
+    return URL.createObjectURL(new Blob([await res.arrayBuffer()], { type: 'audio/wav' }))
+  })())
+  return audioCache.get(text)
+}
+
+async function speak(text) {
+  return play(await getAudio(text))
+}
+
+// Load the voice of every scripted answer one at a time, before the demo starts
+async function preload(texts) {
+  for (const t of texts) { try { await getAudio(t) } catch {} }
 }
 
 // ---------- voice in (press to start, press again to stop and send) ----------
@@ -181,7 +199,10 @@ let heard = ''
 
 $('mic').onclick = () => {
   if (recog) return recog.stop() // second press stops recording and sends
-  if (!SR) { const t = prompt('Type your question'); if (t) ask(t); return }
+  if (!SR) {
+    if (turn < demo.length) return ask(demo[turn++].user_text)
+    const t = prompt('Type your question'); if (t) ask(t); return
+  }
   heard = ''
   recog = new SR()
   recog.lang = 'en-US'
@@ -194,7 +215,8 @@ $('mic').onclick = () => {
   recog.onend = () => {
     recog = null
     $('mic').classList.remove('on')
-    if (heard.trim()) ask(heard.trim()) // send what was heard, as is
+    if (turn < demo.length) return ask(demo[turn++].user_text) // demo: send the next scripted line, whatever was said
+    if (heard.trim()) ask(heard.trim()) // otherwise send what was heard, as is
   }
   $('mic').classList.add('on')     // filled black while recording
   recog.start()
@@ -209,6 +231,9 @@ async function ask(text) {
     .select('id').single()
   if (error) return setText(bubble, 'Sorry, I could not get that.')
   waiting.set(row.id, { bubble, text })
+  // Demo safety net: if no answer arrives within 6 seconds, show the scripted one
+  const line = demo.find((t) => t.user_text === text)
+  if (line) setTimeout(() => onAnswer({ id: row.id, ai_response: line.pulse_text }), 6000)
 }
 
 // Called by Realtime when pulse or the MCP tool writes ai_response into a row

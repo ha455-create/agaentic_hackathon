@@ -73,8 +73,8 @@
 </div>
 
 <script>
-const SUPABASE_URL = 'https://wumnthpdoqswdtpbunev.supabase.co'
-const SUPABASE_KEY = 'sb_publishable_tIT2i2raWHj1kidB0GtzbQ_1erB27Mz'
+const SUPABASE_URL = 'https://YOUR-REF.supabase.co'
+const SUPABASE_KEY = 'YOUR-PUBLISHABLE-KEY'
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
 
 const $ = (id) => document.getElementById(id)
@@ -263,6 +263,23 @@ async function speakInto(el, text) {
   })
 }
 
+// Demo routing (Step 7): if what was heard sounds like the next scripted line, or nothing was heard,
+// send that scripted line. Anything else is a live question for Gemini, and the script waits.
+function route(said) {
+  const next = demo[turn]
+  if (next && (!said.trim() || similar(said, next.user_text))) { turn++; return ask(next.user_text) }
+  if (said.trim()) ask(said.trim())
+}
+
+// True when at least 40% of the scripted line's words were heard (speech recognition is never exact)
+function similar(a, b) {
+  const words = (s) => new Set(s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2))
+  const heardWords = words(a), lineWords = words(b)
+  let shared = 0
+  for (const w of lineWords) if (heardWords.has(w)) shared++
+  return lineWords.size > 0 && shared / lineWords.size >= 0.4
+}
+
 // ---------- voice in (press to start, press again to stop and send) ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition
 let heard = ''
@@ -270,10 +287,7 @@ let heard = ''
 $('mic').onclick = () => {
   if (recog) return recog.stop() // second press stops recording and sends
   unlockAudio()
-  if (!SR) {
-    if (turn < demo.length) return ask(demo[turn++].user_text)
-    const t = prompt('Type your question'); if (t) ask(t); return
-  }
+  if (!SR) { route(prompt('Type your question') ?? ''); return }
   heard = ''
   recog = new SR()
   recog.lang = 'en-US'
@@ -286,8 +300,7 @@ $('mic').onclick = () => {
   recog.onend = () => {
     recog = null
     $('mic').classList.remove('on')
-    if (turn < demo.length) return ask(demo[turn++].user_text) // demo: send the next scripted line, whatever was said
-    if (heard.trim()) ask(heard.trim()) // otherwise send what was heard, as is
+    route(heard) // the next scripted line if it sounds like it, otherwise a live question
   }
   $('mic').classList.add('on')     // filled black while recording
   recog.start()
@@ -307,13 +320,12 @@ async function ask(text) {
   if (error) return setText(bubble, 'Sorry, I could not get that.')
   waiting.set(row.id, { bubble, text })
   if (early.has(row.id)) onAnswer(early.get(row.id))
-  // Demo (Step 7): 2 seconds after the presenter finishes asking, write the scripted answer into
-  // ai_charts.ai_response, then Pulse reads it aloud. Realtime sees the same update; onAnswer plays it once.
+  sb.functions.invoke('pulse', { body: { action: 'answer', row_id: row.id } }) // pulse writes ai_response
+  // Demo (Step 7): pulse writes the scripted reply into ai_response about 2 seconds after the question.
+  // Safety net: if nothing has arrived 8 seconds after asking, show the scripted reply so the demo never stalls.
   const line = demo.find((t) => t.user_text === text)
-  if (line) setTimeout(async () => {
-    await sb.from('ai_charts').update({ ai_response: line.pulse_text }).eq('id', row.id).is('ai_response', null)
-    onAnswer({ id: row.id, ai_response: line.pulse_text })
-  }, Math.max(0, 2000 - (Date.now() - asked)))
+  if (line) setTimeout(() => onAnswer({ id: row.id, ai_response: line.pulse_text }),
+    Math.max(0, 8000 - (Date.now() - asked)))
 }
 
 // Called by Realtime when pulse or the MCP tool writes ai_response into a row

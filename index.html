@@ -96,6 +96,7 @@ const early = new Map()   // answers that arrive before the question finished ro
 let me = null             // the signed-in user; me.id is the uuid posted with every question
 let demo = []             // scripted turns from demo_script (Step 7)
 let turn = 0              // the next scripted turn
+let asking = false        // a question is being saved; the mic waits until it is
 
 // ---------- auth ----------
 $('login').onsubmit = async (e) => {
@@ -263,31 +264,23 @@ async function speakInto(el, text) {
   })
 }
 
-// Demo routing (Step 7): if what was heard sounds like the next scripted line, or nothing was heard,
-// send that scripted line. Anything else is a live question for Gemini, and the script waits.
-function route(said) {
-  const next = demo[turn]
-  if (next && (!said.trim() || similar(said, next.user_text))) { turn++; return ask(next.user_text) }
-  if (said.trim()) ask(said.trim())
-}
-
-// True when at least 40% of the scripted line's words were heard (speech recognition is never exact)
-function similar(a, b) {
-  const words = (s) => new Set(s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2))
-  const heardWords = words(a), lineWords = words(b)
-  let shared = 0
-  for (const w of lineWords) if (heardWords.has(w)) shared++
-  return lineWords.size > 0 && shared / lineWords.size >= 0.4
-}
-
-// ---------- voice in (press to start, press again to stop and send) ----------
+// ---------- voice in: scripted turns first, then live recording ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition
 let heard = ''
 
 $('mic').onclick = () => {
-  if (recog) return recog.stop() // second press stops recording and sends
   unlockAudio()
-  if (!SR) { route(prompt('Type your question') ?? ''); return }
+  // Demo turns (Step 7): the mic does not record. The first press turns it black,
+  // the second sends the next scripted line. Live recording starts only after every scripted answer is in.
+  if (turn < demo.length || asking || waiting.size > 0) {
+    if (turn >= demo.length) return                     // an answer is still on its way
+    if (!$('mic').classList.contains('on')) return $('mic').classList.add('on')
+    $('mic').classList.remove('on')
+    return ask(demo[turn++].user_text)
+  }
+  // Live: real recording, sent exactly as said
+  if (recog) return recog.stop() // second press stops recording and sends
+  if (!SR) { const t = prompt('Type your question'); if (t) ask(t); return }
   heard = ''
   recog = new SR()
   recog.lang = 'en-US'
@@ -300,7 +293,7 @@ $('mic').onclick = () => {
   recog.onend = () => {
     recog = null
     $('mic').classList.remove('on')
-    route(heard) // the next scripted line if it sounds like it, otherwise a live question
+    if (heard.trim()) ask(heard.trim()) // live question, sent as said
   }
   $('mic').classList.add('on')     // filled black while recording
   recog.start()
@@ -309,6 +302,7 @@ $('mic').onclick = () => {
 // ---------- ask Pulse: insert into ai_charts, wait for ai_response ----------
 async function ask(text) {
   const asked = Date.now()                             // when the presenter finished asking
+  asking = true
   const saved = sb.from('ai_charts')
     .insert({ user_id: me.id, user_prompt: text })   // the user's uuid plus what they said
     .select('id').single()
@@ -317,15 +311,16 @@ async function ask(text) {
   await meBubble(text)                                 // the question rolls out word by word
   const bubble = aiBubble()                            // then an empty black pill until ai_response arrives
   const { data: row, error } = await saved
-  if (error) return setText(bubble, 'Sorry, I could not get that.')
+  if (error) { asking = false; return setText(bubble, 'Sorry, I could not get that.') }
   waiting.set(row.id, { bubble, text })
+  asking = false
   if (early.has(row.id)) onAnswer(early.get(row.id))
   sb.functions.invoke('pulse', { body: { action: 'answer', row_id: row.id } }) // pulse writes ai_response
-  // Demo (Step 7): pulse writes the scripted reply into ai_response about 2 seconds after the question.
-  // Safety net: if nothing has arrived 8 seconds after asking, show the scripted reply so the demo never stalls.
+  // Demo (Step 7): pulse writes the scripted reply into ai_response about 4 seconds after the question.
+  // Safety net: if nothing has arrived 10 seconds after asking, show the scripted reply so the demo never stalls.
   const line = demo.find((t) => t.user_text === text)
   if (line) setTimeout(() => onAnswer({ id: row.id, ai_response: line.pulse_text }),
-    Math.max(0, 8000 - (Date.now() - asked)))
+    Math.max(0, 10000 - (Date.now() - asked)))
 }
 
 // Called by Realtime when pulse or the MCP tool writes ai_response into a row

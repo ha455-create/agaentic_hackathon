@@ -72,8 +72,8 @@
 </div>
 
 <script>
-const SUPABASE_URL = 'https://YOUR-REF.supabase.co'
-const SUPABASE_KEY = 'YOUR-PUBLISHABLE-KEY'
+const SUPABASE_URL = 'https://wumnthpdoqswdtpbunev.supabase.co'
+const SUPABASE_KEY = 'sb_publishable_tIT2i2raWHj1kidB0GtzbQ_1erB27Mz'
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
 
 const $ = (id) => document.getElementById(id)
@@ -84,6 +84,8 @@ const SPEAKER = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 9h3l5-
 const player = new Audio()
 const audioCache = new Map() // text -> object URL, so a replay does not call TTS again
 let recog = null
+const waiting = new Map() // ai_charts row id -> { bubble, text } until ai_response arrives
+let me = null             // the signed-in user; me.id is the uuid posted with every question
 
 // ---------- auth ----------
 $('login').onsubmit = async (e) => {
@@ -114,6 +116,14 @@ async function boot() {
   const { data: rows } = await sb.from('ai_charts').select('user_prompt, ai_response')
     .gte('created_at', since.toISOString()).order('created_at')
   for (const r of rows ?? []) { meBubble(r.user_prompt); aiBubble(r.ai_response) }
+
+  // 3. Hear ai_response arrive in real time
+  me = (await sb.auth.getUser()).data.user
+  sb.channel('ai_charts')
+    .on('postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'ai_charts', filter: `user_id=eq.${me.id}` },
+      (change) => onAnswer(change.new))
+    .subscribe()
 }
 
 // ---------- bubbles ----------
@@ -190,21 +200,30 @@ $('mic').onclick = () => {
   recog.start()
 }
 
-// ---------- ask Pulse ----------
+// ---------- ask Pulse: insert into ai_charts, wait for ai_response ----------
 async function ask(text) {
   meBubble(text)
-  const bubble = aiBubble() // empty black pill while Pulse answers
-  try {
-    const { data, error } = await sb.functions.invoke('pulse', { body: { action: 'ask', prompt: text } })
-    if (error) throw error
-    setText(bubble, data.answer)
-    await speak(data.answer)
-    if (data.episode) { // podcast answer: play the generated episode next
-      const { data: s } = await sb.storage.from('audio').createSignedUrl(data.episode, 3600)
+  const bubble = aiBubble() // empty black pill until ai_response arrives
+  const { data: row, error } = await sb.from('ai_charts')
+    .insert({ user_id: me.id, user_prompt: text })   // the user's uuid plus what they said
+    .select('id').single()
+  if (error) return setText(bubble, 'Sorry, I could not get that.')
+  waiting.set(row.id, { bubble, text })
+}
+
+// Called by Realtime when pulse or the MCP tool writes ai_response into a row
+async function onAnswer(row) {
+  const w = waiting.get(row.id)
+  if (!w || !row.ai_response) return
+  waiting.delete(row.id)
+  setText(w.bubble, row.ai_response)
+  await speak(row.ai_response)
+  if (/podcast/i.test(w.text)) { // podcast answer: play the commute episode next
+    const { data: b } = await sb.from('briefs').select('episode_path').eq('day', todayNY()).maybeSingle()
+    if (b?.episode_path) {
+      const { data: s } = await sb.storage.from('audio').createSignedUrl(b.episode_path, 3600)
       play(s.signedUrl)
     }
-  } catch (err) {
-    setText(bubble, 'Sorry, I could not get that.')
   }
 }
 </script>

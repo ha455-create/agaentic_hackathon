@@ -10,13 +10,15 @@
   * { box-sizing:border-box; margin:0 }
   html, body { height:100% }
   body { font-family:Inter, system-ui, -apple-system, sans-serif; background:var(--paper); color:var(--ink) }
-  .screen { max-width:430px; height:100%; margin:0 auto; display:flex; flex-direction:column;
+  .screen { max-width:430px; height:100%; height:100dvh; margin:0 auto; display:flex; flex-direction:column;
             padding:calc(16px + env(safe-area-inset-top)) 20px calc(40px + env(safe-area-inset-bottom)) }
   .topbar { display:flex; justify-content:space-between; align-items:center }
   .icon-btn { background:none; border:0; padding:4px; color:var(--ink); cursor:pointer }
   .icon-btn svg { width:34px; height:34px; display:block }
 
-  #thread { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:14px; padding:22px 0 }
+  #thread { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+            display:flex; flex-direction:column; gap:14px; padding:22px 0 }   /* swipeable thread */
+  #thread > * { flex-shrink:0 }   /* bubbles keep their full height as the thread grows */
   .ai { align-self:flex-start; max-width:78%; min-height:36px; display:flex; align-items:flex-end; gap:12px;
         background:var(--ink); color:var(--paper); border-radius:18px; padding:9px 12px 9px 16px }
   .ai .text { white-space:normal; font-size:14px; font-weight:500; line-height:1.35; text-align:left }
@@ -142,7 +144,18 @@ async function boot() {
 }
 
 // ---------- bubbles ----------
-function scrollDown() { $('thread').scrollTop = $('thread').scrollHeight }
+// Stick to the newest line, like a chat app. Swiping up to read turns that off;
+// coming back to the bottom, or asking a new question, turns it back on.
+let stick = true
+function scrollDown(force = false) {
+  const t = $('thread')
+  if (force) stick = true
+  if (stick) t.scrollTop = t.scrollHeight
+}
+$('thread').addEventListener('scroll', () => {
+  const t = $('thread')
+  stick = t.scrollHeight - t.scrollTop - t.clientHeight < 40
+})
 
 // William's question: rolls out word by word, or appears at once for past rows
 function meBubble(text, instant = false) {
@@ -286,6 +299,7 @@ async function ask(text) {
     .insert({ user_id: me.id, user_prompt: text })   // the user's uuid plus what they said
     .select('id').single()
     .then((r) => r)                                    // starts saving right away
+  scrollDown(true)                                     // a new question snaps back to the newest line
   await meBubble(text)                                 // the question rolls out word by word
   const bubble = aiBubble()                            // then an empty black pill until ai_response arrives
   const { data: row, error } = await saved

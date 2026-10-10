@@ -73,8 +73,8 @@
 </div>
 
 <script>
-const SUPABASE_URL = 'https://wumnthpdoqswdtpbunev.supabase.co'
-const SUPABASE_KEY = 'sb_publishable_tIT2i2raWHj1kidB0GtzbQ_1erB27Mz'
+const SUPABASE_URL = 'https://YOUR-REF.supabase.co'
+const SUPABASE_KEY = 'YOUR-PUBLISHABLE-KEY'
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
 
 const $ = (id) => document.getElementById(id)
@@ -295,6 +295,7 @@ $('mic').onclick = () => {
 
 // ---------- ask Pulse: insert into ai_charts, wait for ai_response ----------
 async function ask(text) {
+  const asked = Date.now()                             // when the presenter finished asking
   const saved = sb.from('ai_charts')
     .insert({ user_id: me.id, user_prompt: text })   // the user's uuid plus what they said
     .select('id').single()
@@ -306,9 +307,13 @@ async function ask(text) {
   if (error) return setText(bubble, 'Sorry, I could not get that.')
   waiting.set(row.id, { bubble, text })
   if (early.has(row.id)) onAnswer(early.get(row.id))
-  // Demo safety net: if no answer arrives within 6 seconds, show the scripted one
+  // Demo (Step 7): 2 seconds after the presenter finishes asking, write the scripted answer into
+  // ai_charts.ai_response, then Pulse reads it aloud. Realtime sees the same update; onAnswer plays it once.
   const line = demo.find((t) => t.user_text === text)
-  if (line) setTimeout(() => onAnswer({ id: row.id, ai_response: line.pulse_text }), 6000)
+  if (line) setTimeout(async () => {
+    await sb.from('ai_charts').update({ ai_response: line.pulse_text }).eq('id', row.id).is('ai_response', null)
+    onAnswer({ id: row.id, ai_response: line.pulse_text })
+  }, Math.max(0, 2000 - (Date.now() - asked)))
 }
 
 // Called by Realtime when pulse or the MCP tool writes ai_response into a row

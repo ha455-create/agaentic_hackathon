@@ -21,10 +21,9 @@
         background:var(--ink); color:var(--paper); border-radius:18px; padding:9px 12px 9px 16px }
   .ai .text { white-space:normal; font-size:14px; font-weight:500; line-height:1.35; text-align:left }
   .ai.pending { width:180px; justify-content:flex-end }
-  .ai.pending .speak { animation:blink 1s infinite }
+  .ai.pending { animation:blink 1s infinite }   /* Pulse is preparing an answer */
   @keyframes blink { 50% { opacity:.3 } }
-  .speak { flex:none; background:none; border:0; padding:0; color:var(--paper); cursor:pointer; display:flex }
-  .speak svg { width:22px; height:22px }
+  .ai .text:empty::after { content:'\00a0' }   /* keeps an empty pill one line tall */
   .me { align-self:flex-end; max-width:68%; border:2px solid var(--ink); border-radius:16px;
         padding:8px 16px; font-size:14px; font-weight:500; line-height:1.35; text-align:left; white-space:normal }
 
@@ -86,13 +85,12 @@ const tidy = (s) => {
   return /[.!?"'\u201d\u2019)]$/.test(c) ? c : c + '.'
 }
 const todayNY = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date())
-const SPEAKER = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 9h3l5-4v14l-5-4H4z"/>
-  <path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
 
 const player = new Audio()
 const audioCache = new Map() // text -> object URL, so a replay does not call TTS again
 let recog = null
 const waiting = new Map() // ai_charts row id -> { bubble, text } until ai_response arrives
+const early = new Map()   // answers that arrive before the question finished rolling out
 let me = null             // the signed-in user; me.id is the uuid posted with every question
 let demo = []             // scripted turns from demo_script (Step 7)
 let turn = 0              // the next scripted turn
@@ -132,7 +130,7 @@ async function boot() {
   const since = new Date(); since.setHours(0, 0, 0, 0)
   const { data: rows } = await sb.from('ai_charts').select('user_prompt, ai_response')
     .gte('created_at', since.toISOString()).order('created_at')
-  if (!demo.length) for (const r of rows ?? []) { meBubble(r.user_prompt); aiBubble(r.ai_response) } // the demo starts clean
+  if (!demo.length) for (const r of rows ?? []) { meBubble(r.user_prompt, true); aiBubble(r.ai_response) } // the demo starts clean
 
   // 3. Hear ai_response arrive in real time
   me = (await sb.auth.getUser()).data.user
@@ -146,20 +144,33 @@ async function boot() {
 // ---------- bubbles ----------
 function scrollDown() { $('thread').scrollTop = $('thread').scrollHeight }
 
-function meBubble(text) {
+// William's question: rolls out word by word, or appears at once for past rows
+function meBubble(text, instant = false) {
   const el = document.createElement('div')
   el.className = 'me'
-  el.textContent = tidy(text)
   $('thread').append(el)
-  scrollDown()
+  if (instant) { el.textContent = tidy(text); scrollDown(); return Promise.resolve() }
+  return rollOut(el, tidy(text))
+}
+
+function rollOut(el, text, msPerWord = 110) {
+  const words = text.split(' ')
+  return new Promise((resolve) => {
+    let i = 0
+    const tick = () => {
+      el.textContent = words.slice(0, ++i).join(' ')
+      scrollDown()
+      if (i < words.length) setTimeout(tick, msPerWord); else resolve()
+    }
+    tick()
+  })
 }
 
 function aiBubble(text = '') {
   const el = document.createElement('div')
   el.className = text ? 'ai' : 'ai pending'
-  el.innerHTML = `<span class="text"></span><button class="speak" aria-label="Play">${SPEAKER}</button>`
+  el.innerHTML = `<span class="text"></span>`
   setText(el, text)
-  el.querySelector('.speak').onclick = () => el.dataset.full && speakInto(el, el.dataset.full)
   $('thread').append(el)
   scrollDown()
   return el
@@ -176,6 +187,15 @@ function setText(el, text) {
 // ---------- voice out (Gemini TTS through pulse) ----------
 function play(src) {
   return new Promise((resolve) => { player.src = src; player.onended = resolve; player.play() })
+}
+
+// Phones only allow sound after a tap: a silent clip on the first mic press lets every answer play by itself
+let unlocked = false
+function unlockAudio() {
+  if (unlocked) return
+  unlocked = true
+  player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  player.play().catch(() => {})
 }
 
 // Fetch the voice once per text and keep it, so a second click plays instantly
@@ -220,6 +240,7 @@ async function speakInto(el, text) {
     const step = () => {
       const d = player.duration
       if (d && isFinite(d)) out.textContent = words.slice(0, Math.ceil(words.length * player.currentTime / d)).join(' ')
+      scrollDown()
       frame = requestAnimationFrame(step)
     }
     player.src = url
@@ -235,6 +256,7 @@ let heard = ''
 
 $('mic').onclick = () => {
   if (recog) return recog.stop() // second press stops recording and sends
+  unlockAudio()
   if (!SR) {
     if (turn < demo.length) return ask(demo[turn++].user_text)
     const t = prompt('Type your question'); if (t) ask(t); return
@@ -260,13 +282,16 @@ $('mic').onclick = () => {
 
 // ---------- ask Pulse: insert into ai_charts, wait for ai_response ----------
 async function ask(text) {
-  meBubble(text)
-  const bubble = aiBubble() // empty black pill until ai_response arrives
-  const { data: row, error } = await sb.from('ai_charts')
+  const saved = sb.from('ai_charts')
     .insert({ user_id: me.id, user_prompt: text })   // the user's uuid plus what they said
     .select('id').single()
+    .then((r) => r)                                    // starts saving right away
+  await meBubble(text)                                 // the question rolls out word by word
+  const bubble = aiBubble()                            // then an empty black pill until ai_response arrives
+  const { data: row, error } = await saved
   if (error) return setText(bubble, 'Sorry, I could not get that.')
   waiting.set(row.id, { bubble, text })
+  if (early.has(row.id)) onAnswer(early.get(row.id))
   // Demo safety net: if no answer arrives within 6 seconds, show the scripted one
   const line = demo.find((t) => t.user_text === text)
   if (line) setTimeout(() => onAnswer({ id: row.id, ai_response: line.pulse_text }), 6000)
@@ -275,7 +300,8 @@ async function ask(text) {
 // Called by Realtime when pulse or the MCP tool writes ai_response into a row
 async function onAnswer(row) {
   const w = waiting.get(row.id)
-  if (!w || !row.ai_response) return
+  if (!row.ai_response) return
+  if (!w) { if (!early.has(row.id)) early.set(row.id, row); return } // arrived while the question was still rolling out
   waiting.delete(row.id)
   const reply = tidy(row.ai_response)
   w.bubble.dataset.full = reply
